@@ -18,6 +18,8 @@ class GridBacktestSettings:
     fee_rate_pct_per_side: Decimal = Decimal("0.10")
     grid_count: int = 10
     reserve_pct: Decimal = Decimal("5")
+    breakout_consecutive_closes: int = 2
+    breakout_policy: str = "STATIC"
 
     def validate(self) -> None:
         if self.initial_capital <= ZERO:
@@ -28,6 +30,12 @@ class GridBacktestSettings:
             raise ValueError("grid_count must be at least 2")
         if not ZERO <= self.reserve_pct < HUNDRED:
             raise ValueError("reserve_pct must be in [0, 100)")
+        if self.breakout_consecutive_closes < 1:
+            raise ValueError("breakout_consecutive_closes must be positive")
+        if self.breakout_policy not in {"STATIC", "FREEZE", "CLOSE"}:
+            raise ValueError(
+                "breakout_policy must be STATIC, FREEZE, or CLOSE"
+            )
 
 
 @dataclass(slots=True)
@@ -54,6 +62,10 @@ class GridBacktestResult:
     max_inventory_value: Decimal
     max_drawdown_pct: Decimal
     capital_return_pct: Decimal
+    breakout_triggered: bool = False
+    breakout_direction: str | None = None
+    breakout_time_ms: int | None = None
+    breakout_policy: str = "STATIC"
     levels: list[Decimal] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, object]:
@@ -73,6 +85,10 @@ class GridBacktestResult:
             "max_inventory_value": self.max_inventory_value,
             "max_drawdown_pct": self.max_drawdown_pct,
             "capital_return_pct": self.capital_return_pct,
+            "breakout_triggered": self.breakout_triggered,
+            "breakout_direction": self.breakout_direction,
+            "breakout_time_ms": self.breakout_time_ms,
+            "breakout_policy": self.breakout_policy,
             "levels": self.levels,
         }
 
@@ -111,6 +127,50 @@ class StaticGridEconomicBacktester:
 
         step = (upper - lower) / Decimal(grid_count)
         return [lower + step * Decimal(i) for i in range(grid_count + 1)]
+
+    def breakout_direction(
+        self,
+        candles: Iterable[Candle],
+        lower: Decimal,
+        upper: Decimal,
+    ) -> str | None:
+        """
+        Return a confirmed directional breakout using only supplied closed candles.
+
+        Confirmation requires N consecutive closes beyond the same boundary.
+        Returning inside the range or crossing to the opposite side resets
+        the previous directional run.
+        """
+        if lower <= ZERO or upper <= lower:
+            raise ValueError("invalid grid range")
+
+        direction: str | None = None
+        consecutive = 0
+
+        for candle in candles:
+            current = (
+                "UPPER"
+                if candle.close > upper
+                else "LOWER"
+                if candle.close < lower
+                else None
+            )
+
+            if current is None:
+                direction = None
+                consecutive = 0
+                continue
+
+            if current == direction:
+                consecutive += 1
+            else:
+                direction = current
+                consecutive = 1
+
+            if consecutive >= self.settings.breakout_consecutive_closes:
+                return direction
+
+        return None
 
     def run(
         self,
@@ -156,6 +216,13 @@ class StaticGridEconomicBacktester:
         peak_equity = self.settings.initial_capital
         max_drawdown_pct = ZERO
 
+        breakout_triggered = False
+        breakout_direction = None
+        breakout_time_ms = None
+        outside_direction = None
+        outside_consecutive = 0
+        frozen = False
+
         # A level may refill after its lot has been sold.
         for candle in candles:
             # Snapshot occupied levels at candle open. This prevents a buy
@@ -188,33 +255,97 @@ class StaticGridEconomicBacktester:
                 round_trips += 1
                 del lots_by_level[level_index]
 
-            # BUY after sells. Never spend unavailable cash.
-            for level_index, buy_price in enumerate(levels[:-1]):
-                if buy_price >= start_price:
-                    continue
-                if level_index in lots_by_level:
-                    continue
-                if candle.low > buy_price:
-                    continue
+            # Breakout decisions use this candle's CLOSE only. Therefore the
+            # signal becomes actionable only after this candle has completed.
+            current_outside_direction = (
+                "UPPER"
+                if candle.close > upper
+                else "LOWER"
+                if candle.close < lower
+                else None
+            )
 
-                # quote_per_buy includes fee, preventing overspend.
-                gross_quote = quote_per_buy / (ONE + fee_fraction)
-                entry_fee = gross_quote * fee_fraction
-                total_cost = gross_quote + entry_fee
+            if current_outside_direction is None:
+                outside_direction = None
+                outside_consecutive = 0
+            elif current_outside_direction == outside_direction:
+                outside_consecutive += 1
+            else:
+                outside_direction = current_outside_direction
+                outside_consecutive = 1
 
-                if cash < total_cost:
-                    continue
+            just_confirmed_breakout = (
+                not breakout_triggered
+                and outside_direction is not None
+                and outside_consecutive
+                >= self.settings.breakout_consecutive_closes
+            )
 
-                quantity = gross_quote / buy_price
+            if just_confirmed_breakout:
+                breakout_triggered = True
+                breakout_direction = outside_direction
+                breakout_time_ms = candle.close_time
 
-                cash -= total_cost
-                fees_paid += entry_fee
-                lots_by_level[level_index] = GridLot(
-                    entry_price=buy_price,
-                    quantity=quantity,
-                    entry_fee=entry_fee,
-                )
-                buy_fills += 1
+                if self.settings.breakout_policy in {"FREEZE", "CLOSE"}:
+                    frozen = True
+
+                if self.settings.breakout_policy == "CLOSE":
+                    # The breakout is known only at candle close, so liquidation
+                    # occurs at that close. Using the candle low/high would
+                    # introduce intrabar look-ahead.
+                    liquidation_price = candle.close
+
+                    for level_index in sorted(list(lots_by_level)):
+                        lot = lots_by_level[level_index]
+
+                        gross_proceeds = lot.quantity * liquidation_price
+                        exit_fee = gross_proceeds * fee_fraction
+                        net_proceeds = gross_proceeds - exit_fee
+
+                        gross_pnl = (
+                            liquidation_price - lot.entry_price
+                        ) * lot.quantity
+                        net_pnl = gross_pnl - lot.entry_fee - exit_fee
+
+                        cash += net_proceeds
+                        fees_paid += exit_fee
+                        realized_gross += gross_pnl
+                        realized_net += net_pnl
+                        sell_fills += 1
+
+                        # Protective liquidation is not a completed grid
+                        # round trip.
+                        del lots_by_level[level_index]
+
+            # BUY after sells and breakout evaluation.
+            # FREEZE/CLOSE cannot create new exposure once confirmed.
+            if not frozen:
+                for level_index, buy_price in enumerate(levels[:-1]):
+                    if buy_price >= start_price:
+                        continue
+                    if level_index in lots_by_level:
+                        continue
+                    if candle.low > buy_price:
+                        continue
+
+                    # quote_per_buy includes fee, preventing overspend.
+                    gross_quote = quote_per_buy / (ONE + fee_fraction)
+                    entry_fee = gross_quote * fee_fraction
+                    total_cost = gross_quote + entry_fee
+
+                    if cash < total_cost:
+                        continue
+
+                    quantity = gross_quote / buy_price
+
+                    cash -= total_cost
+                    fees_paid += entry_fee
+                    lots_by_level[level_index] = GridLot(
+                        entry_price=buy_price,
+                        quantity=quantity,
+                        entry_fee=entry_fee,
+                    )
+                    buy_fills += 1
 
             mark_price = candle.close
             inventory_value = sum(
@@ -271,5 +402,9 @@ class StaticGridEconomicBacktester:
             max_inventory_value=max_inventory_value,
             max_drawdown_pct=max_drawdown_pct,
             capital_return_pct=capital_return_pct,
+            breakout_triggered=breakout_triggered,
+            breakout_direction=breakout_direction,
+            breakout_time_ms=breakout_time_ms,
+            breakout_policy=self.settings.breakout_policy,
             levels=levels,
         )

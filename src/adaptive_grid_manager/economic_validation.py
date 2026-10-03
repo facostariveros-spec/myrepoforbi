@@ -113,6 +113,8 @@ async def run(args: argparse.Namespace) -> Path:
             fee_rate_pct_per_side=dec(args.fee_rate_pct),
             grid_count=args.grid_count,
             reserve_pct=dec(args.reserve_pct),
+            breakout_consecutive_closes=args.breakout_consecutive_closes,
+            breakout_policy=args.breakout_policy,
         )
     )
 
@@ -242,6 +244,10 @@ async def run(args: argparse.Namespace) -> Path:
                 "completed_round_trips": result.completed_round_trips,
                 "max_inventory_value": result.max_inventory_value,
                 "max_drawdown_pct": result.max_drawdown_pct,
+                "breakout_triggered": result.breakout_triggered,
+                "breakout_direction": result.breakout_direction,
+                "breakout_time_ms": result.breakout_time_ms,
+                "breakout_policy": result.breakout_policy,
                 "ending_cash": result.cash,
                 "ending_inventory_quantity": result.inventory_quantity,
                 "ending_inventory_value": result.inventory_value,
@@ -288,6 +294,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--capital", default="500")
     parser.add_argument("--fee-rate-pct", default="0.10")
     parser.add_argument("--grid-count", type=int, default=10)
+    parser.add_argument(
+        "--breakout-consecutive-closes",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--breakout-policy",
+        choices=["STATIC", "FREEZE", "CLOSE"],
+        default="STATIC",
+    )
     parser.add_argument("--reserve-pct", default="5")
     return parser
 
