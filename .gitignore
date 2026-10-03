@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+.env.*
+*.log
+*.egg-info/
+dist/
+build/
+.calibration_cache/
+calibration_results/
