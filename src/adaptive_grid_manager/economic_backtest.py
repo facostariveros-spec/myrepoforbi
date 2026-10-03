@@ -20,6 +20,8 @@ class GridBacktestSettings:
     reserve_pct: Decimal = Decimal("5")
     breakout_consecutive_closes: int = 2
     breakout_policy: str = "STATIC"
+    breakout_close_delay_minutes: int = 0
+    breakout_recovery_continuation_ratio: Decimal = Decimal("0.25")
 
     def validate(self) -> None:
         if self.initial_capital <= ZERO:
@@ -32,9 +34,24 @@ class GridBacktestSettings:
             raise ValueError("reserve_pct must be in [0, 100)")
         if self.breakout_consecutive_closes < 1:
             raise ValueError("breakout_consecutive_closes must be positive")
-        if self.breakout_policy not in {"STATIC", "FREEZE", "CLOSE"}:
+        if self.breakout_policy not in {
+            "STATIC",
+            "FREEZE",
+            "CLOSE",
+            "DELAYED_CLOSE",
+            "CONDITIONAL_CLOSE",
+        }:
             raise ValueError(
-                "breakout_policy must be STATIC, FREEZE, or CLOSE"
+                "breakout_policy must be STATIC, FREEZE, CLOSE, "
+                "DELAYED_CLOSE, or CONDITIONAL_CLOSE"
+            )
+        if self.breakout_close_delay_minutes < 0:
+            raise ValueError(
+                "breakout_close_delay_minutes cannot be negative"
+            )
+        if self.breakout_recovery_continuation_ratio < ZERO:
+            raise ValueError(
+                "breakout_recovery_continuation_ratio cannot be negative"
             )
 
 
@@ -66,6 +83,9 @@ class GridBacktestResult:
     breakout_direction: str | None = None
     breakout_time_ms: int | None = None
     breakout_policy: str = "STATIC"
+    protective_close_triggered: bool = False
+    protective_close_time_ms: int | None = None
+    protective_close_price: Decimal | None = None
     levels: list[Decimal] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, object]:
@@ -89,6 +109,9 @@ class GridBacktestResult:
             "breakout_direction": self.breakout_direction,
             "breakout_time_ms": self.breakout_time_ms,
             "breakout_policy": self.breakout_policy,
+            "protective_close_triggered": self.protective_close_triggered,
+            "protective_close_time_ms": self.protective_close_time_ms,
+            "protective_close_price": self.protective_close_price,
             "levels": self.levels,
         }
 
@@ -223,6 +246,18 @@ class StaticGridEconomicBacktester:
         outside_consecutive = 0
         frozen = False
 
+        protective_close_triggered = False
+        protective_close_time_ms = None
+        protective_close_price = None
+
+        breakout_confirmation_price = None
+        post_breakout_worst_price = None
+        post_breakout_best_price = None
+
+        # CONDITIONAL_CLOSE is evaluated exactly once at its configured
+        # post-breakout checkpoint. KEEP is as final as CLOSE.
+        conditional_decision_evaluated = False
+
         # A level may refill after its lot has been sold.
         for candle in candles:
             # Snapshot occupied levels at candle open. This prevents a buy
@@ -285,8 +320,14 @@ class StaticGridEconomicBacktester:
                 breakout_triggered = True
                 breakout_direction = outside_direction
                 breakout_time_ms = candle.close_time
+                breakout_confirmation_price = candle.close
 
-                if self.settings.breakout_policy in {"FREEZE", "CLOSE"}:
+                if self.settings.breakout_policy in {
+                    "FREEZE",
+                    "CLOSE",
+                    "DELAYED_CLOSE",
+                    "CONDITIONAL_CLOSE",
+                }:
                     frozen = True
 
                 if self.settings.breakout_policy == "CLOSE":
@@ -294,6 +335,10 @@ class StaticGridEconomicBacktester:
                     # occurs at that close. Using the candle low/high would
                     # introduce intrabar look-ahead.
                     liquidation_price = candle.close
+
+                    protective_close_triggered = True
+                    protective_close_time_ms = candle.close_time
+                    protective_close_price = liquidation_price
 
                     for level_index in sorted(list(lots_by_level)):
                         lot = lots_by_level[level_index]
@@ -317,8 +362,145 @@ class StaticGridEconomicBacktester:
                         # round trip.
                         del lots_by_level[level_index]
 
+            # CONDITIONAL_CLOSE freezes immediately at confirmation,
+            # observes only subsequently CLOSED candles, and evaluates once
+            # the configured delay has elapsed.
+            if (
+                self.settings.breakout_policy == "CONDITIONAL_CLOSE"
+                and breakout_triggered
+                and breakout_direction == "LOWER"
+                and breakout_time_ms is not None
+                and breakout_confirmation_price is not None
+                and candle.close_time > breakout_time_ms
+                and not protective_close_triggered
+                and not conditional_decision_evaluated
+            ):
+                if post_breakout_worst_price is None:
+                    post_breakout_worst_price = candle.low
+                    post_breakout_best_price = candle.high
+                else:
+                    post_breakout_worst_price = min(
+                        post_breakout_worst_price,
+                        candle.low,
+                    )
+                    post_breakout_best_price = max(
+                        post_breakout_best_price,
+                        candle.high,
+                    )
+
+                decision_time_ms = (
+                    breakout_time_ms
+                    + self.settings.breakout_close_delay_minutes * 60_000
+                )
+
+                if candle.close_time >= decision_time_ms:
+                    # One-shot decision point. Once this checkpoint is
+                    # reached, later candles must never reconsider it.
+                    conditional_decision_evaluated = True
+
+                    continuation = max(
+                        ZERO,
+                        breakout_confirmation_price
+                        - post_breakout_worst_price,
+                    )
+                    recovery = max(
+                        ZERO,
+                        post_breakout_best_price
+                        - breakout_confirmation_price,
+                    )
+
+                    return_is_negative = (
+                        candle.close < breakout_confirmation_price
+                    )
+
+                    ratio_is_weak = (
+                        continuation > ZERO
+                        and recovery / continuation
+                        < self.settings.breakout_recovery_continuation_ratio
+                    )
+
+                    if return_is_negative and ratio_is_weak:
+                        liquidation_price = candle.close
+
+                        protective_close_triggered = True
+                        protective_close_time_ms = candle.close_time
+                        protective_close_price = liquidation_price
+
+                        for level_index in sorted(list(lots_by_level)):
+                            lot = lots_by_level[level_index]
+
+                            gross_proceeds = (
+                                lot.quantity * liquidation_price
+                            )
+                            exit_fee = (
+                                gross_proceeds * fee_fraction
+                            )
+                            net_proceeds = (
+                                gross_proceeds - exit_fee
+                            )
+
+                            gross_pnl = (
+                                liquidation_price - lot.entry_price
+                            ) * lot.quantity
+                            net_pnl = (
+                                gross_pnl
+                                - lot.entry_fee
+                                - exit_fee
+                            )
+
+                            cash += net_proceeds
+                            fees_paid += exit_fee
+                            realized_gross += gross_pnl
+                            realized_net += net_pnl
+                            sell_fills += 1
+
+                            # Protective liquidation is not a completed
+                            # grid round trip.
+                            del lots_by_level[level_index]
+
+            # DELAYED_CLOSE freezes immediately at confirmation,
+            # then liquidates existing inventory at the first CLOSED candle
+            # whose close time reaches the configured delay.
+            if (
+                self.settings.breakout_policy == "DELAYED_CLOSE"
+                and breakout_triggered
+                and not protective_close_triggered
+                and breakout_time_ms is not None
+                and candle.close_time
+                >= breakout_time_ms
+                + self.settings.breakout_close_delay_minutes * 60_000
+            ):
+                liquidation_price = candle.close
+
+                protective_close_triggered = True
+                protective_close_time_ms = candle.close_time
+                protective_close_price = liquidation_price
+
+                for level_index in sorted(list(lots_by_level)):
+                    lot = lots_by_level[level_index]
+
+                    gross_proceeds = lot.quantity * liquidation_price
+                    exit_fee = gross_proceeds * fee_fraction
+                    net_proceeds = gross_proceeds - exit_fee
+
+                    gross_pnl = (
+                        liquidation_price - lot.entry_price
+                    ) * lot.quantity
+                    net_pnl = gross_pnl - lot.entry_fee - exit_fee
+
+                    cash += net_proceeds
+                    fees_paid += exit_fee
+                    realized_gross += gross_pnl
+                    realized_net += net_pnl
+                    sell_fills += 1
+
+                    # Protective liquidation is not a completed
+                    # grid round trip.
+                    del lots_by_level[level_index]
+
             # BUY after sells and breakout evaluation.
-            # FREEZE/CLOSE cannot create new exposure once confirmed.
+            # FREEZE/CLOSE/DELAYED_CLOSE cannot create new exposure
+            # once confirmed.
             if not frozen:
                 for level_index, buy_price in enumerate(levels[:-1]):
                     if buy_price >= start_price:
@@ -406,5 +588,8 @@ class StaticGridEconomicBacktester:
             breakout_direction=breakout_direction,
             breakout_time_ms=breakout_time_ms,
             breakout_policy=self.settings.breakout_policy,
+            protective_close_triggered=protective_close_triggered,
+            protective_close_time_ms=protective_close_time_ms,
+            protective_close_price=protective_close_price,
             levels=levels,
         )

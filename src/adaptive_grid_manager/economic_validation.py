@@ -115,6 +115,10 @@ async def run(args: argparse.Namespace) -> Path:
             reserve_pct=dec(args.reserve_pct),
             breakout_consecutive_closes=args.breakout_consecutive_closes,
             breakout_policy=args.breakout_policy,
+            breakout_close_delay_minutes=args.breakout_close_delay_minutes,
+            breakout_recovery_continuation_ratio=dec(
+                args.breakout_recovery_continuation_ratio
+            ),
         )
     )
 
@@ -248,6 +252,10 @@ async def run(args: argparse.Namespace) -> Path:
                 "breakout_direction": result.breakout_direction,
                 "breakout_time_ms": result.breakout_time_ms,
                 "breakout_policy": result.breakout_policy,
+                "protective_close_triggered": result.protective_close_triggered,
+                "protective_close_time_ms": result.protective_close_time_ms,
+                "protective_close_price": result.protective_close_price,
+                "breakout_close_delay_minutes": args.breakout_close_delay_minutes,
                 "ending_cash": result.cash,
                 "ending_inventory_quantity": result.inventory_quantity,
                 "ending_inventory_value": result.inventory_value,
@@ -301,8 +309,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--breakout-policy",
-        choices=["STATIC", "FREEZE", "CLOSE"],
+        choices=[
+            "STATIC",
+            "FREEZE",
+            "CLOSE",
+            "DELAYED_CLOSE",
+            "CONDITIONAL_CLOSE",
+        ],
         default="STATIC",
+    )
+    parser.add_argument(
+        "--breakout-close-delay-minutes",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--breakout-recovery-continuation-ratio",
+        default="0.25",
     )
     parser.add_argument("--reserve-pct", default="5")
     return parser
